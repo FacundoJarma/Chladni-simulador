@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "build": "npx vite build"
+  },
   "dependencies": {
     "three": "^0.181.2"
   },
