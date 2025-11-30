@@ -1,0 +1,333 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Chladni Web</title>
+<style>
+  body {
+    margin:0;
+    background:#0a0a0a;
+    overflow:hidden;
+    color:#eee;
+    font-family: "Segoe UI", Roboto, sans-serif;
+  }
+
+  #controls {
+    position:fixed;
+    left:20px;
+    top:20px;
+    z-index:10;
+    display:flex;
+    flex-direction: column;
+    gap:18px;
+    padding:18px;
+    background: rgba(20,20,20,0.8);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.6);
+  }
+
+  #controls button {
+    padding:8px 14px;
+    border:none;
+    border-radius:8px;
+    background:#333;
+    color:#fff;
+    cursor:pointer;
+    font-size:14px;
+    transition:0.2s;
+  }
+
+  #controls button:hover { background:#555; }
+
+  #fileInput {
+    background:#222;
+    color:#ddd;
+    padding:6px;
+    border-radius:6px;
+  }
+
+  .slider-block label { font-size: 13px; opacity: 0.8; }
+  .slider-block input[type="range"] { width:160px; }
+
+  #c {
+    width: 75vmin;
+    height: 75vmin;
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    background:black;
+    border-radius: 16px;
+    box-shadow: 
+      0 0 40px rgba(0,255,200,0.15), 
+      0 0 80px rgba(0,255,200,0.05);
+  }
+</style>
+</head>
+<body>
+
+<div id="controls">
+
+  <div>
+    <input id="fileInput" type="file" accept="audio/*">
+    <button id="micButton">🎤 Mic</button>
+  </div>
+
+  <div>
+    <button id="playBtn">▶ Play</button>
+    <button id="pauseBtn">⏸ Pause</button>
+    <button id="testBtn">🧪 Test</button>
+  </div>
+
+  <!-- Nuevo slider para adelantar/atrasar -->
+  <div class="slider-block">
+  <input id="seekSlider" type="range" min="0" max="1" step="0.001" value="0">
+</div>
+
+
+</div>
+
+<canvas id="c" width="600" height="600"></canvas>
+
+<script>
+/* ------------------- WebGL ------------------- */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl');
+
+if (!gl) { alert("WebGL no disponible"); throw "WebGL no disponible"; }
+
+gl.viewport(0,0,canvas.width,canvas.height);
+
+/* ------------------- Audio ------------------- */
+let audioCtx = null, analyser = null, source = null, spectrum = null;
+let audioBuffer = null;
+let startTime = 0;
+let startOffset = 0;
+
+const fftSize = 4096;
+
+let isTestMode = false;
+let isPaused = false;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = fftSize;
+    analyser.smoothingTimeConstant = 0.6;
+    spectrum = new Uint8Array(analyser.frequencyBinCount);
+  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+
+/* ------------------- Shaders ------------------- */
+const vs = `
+attribute vec2 position;
+void main(){
+  gl_Position = vec4(position,0,1);
+}
+`;
+
+const fs = `
+precision highp float;
+
+uniform float u_mode[16];
+uniform vec2 u_nm[16];
+uniform vec2 u_res;
+uniform vec2 u_offset;
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / u_res;
+
+  vec2 p = (uv - 0.5) * 2.5 + u_offset;
+
+  float sum = 0.0;
+  for(int i=0;i<16;i++){
+    float A = u_mode[i];
+    float n = u_nm[i].x;
+    float m = u_nm[i].y;
+    sum += A * sin(n*3.14159*(p.x+0.5)) * sin(m*3.14159*(p.y+0.5));
+  }
+
+  float v = abs(sum);
+  v = pow(v, 2.0);
+  float line = 1.0 - smoothstep(0.03,0.06,v);
+
+  gl_FragColor = vec4(vec3(line),1.0);
+}
+`;
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    console.error("Shader error:", gl.getShaderInfoLog(s));
+  return s;
+}
+
+const program = gl.createProgram();
+gl.attachShader(program, compile(gl.VERTEX_SHADER, vs));
+gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(program);
+gl.useProgram(program);
+
+/* ------------------- Quad ------------------- */
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1,-1, 1,-1, -1,1,
+  -1,1, 1,-1, 1,1
+]), gl.STATIC_DRAW);
+
+const posLoc = gl.getAttribLocation(program,'position');
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc,2,gl.FLOAT,false,0,0);
+
+/* ------------------- Modos ------------------- */
+const nm=[];
+for (let s=2; nm.length<32; s++){
+  for(let n=1;n<s && nm.length<32;n++){ nm.push(n, s-n); }
+}
+
+gl.uniform2fv(gl.getUniformLocation(program,'u_nm'), new Float32Array(nm));
+gl.uniform2f(gl.getUniformLocation(program,'u_res'), canvas.width, canvas.height);
+
+const u_modesLoc = gl.getUniformLocation(program,"u_mode");
+const u_offsetLoc = gl.getUniformLocation(program,"u_offset");
+
+/* ----- Offset fijo en 0.25 ----- */
+let offsetX = 0.5;
+let offsetY = 0.5;
+gl.uniform2f(u_offsetLoc, offsetX, offsetY);
+
+/* ---------------- FILE INPUT ---------------- */
+fileInput.addEventListener('change', async ev=>{
+  ensureAudio();
+  isTestMode = false;
+
+  if (source) try { source.disconnect(); } catch(e){}
+
+  const file = ev.target.files[0];
+  if (!file) return;
+
+  const arr = await file.arrayBuffer();
+  audioBuffer = await audioCtx.decodeAudioData(arr);
+
+  playFrom(0);
+});
+
+/* ---------------- MIC ---------------- */
+micButton.addEventListener('click', async ()=>{
+  ensureAudio();
+  isTestMode = false;
+
+  if (source) try { source.disconnect(); } catch(e){}
+
+  const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+  source = audioCtx.createMediaStreamSource(stream);
+  source.connect(analyser);
+  analyser.connect(audioCtx.destination);
+});
+
+/* ------------- PLAY/PAUSE ------------- */
+function playFrom(sec){
+  if (!audioBuffer) return;
+
+  if (source) try { source.stop(); } catch(e){}
+
+  source = audioCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  startTime = audioCtx.currentTime;
+  startOffset = sec;
+
+  source.start(0, sec);
+}
+
+playBtn.onclick = ()=> {
+  isPaused = false;
+  if (audioCtx) audioCtx.resume();
+};
+
+pauseBtn.onclick = ()=> {
+  isPaused = true;
+  if (audioCtx) audioCtx.suspend();
+};
+
+testBtn.onclick = ()=> isTestMode = true;
+
+/* ------------- SEEKBAR (adelantar/atrasar) ------------- */
+const seekSlider = document.getElementById("seekSlider");
+
+let isSeeking = false;
+
+// Cuando el usuario mueve la barra
+seekSlider.oninput = () => {
+  if (!audioBuffer) return;
+  isSeeking = true;
+
+  const pos = seekSlider.value * audioBuffer.duration;
+  playFrom(pos);
+
+  // pequeño delay para evitar "pelea" entre el update manual y el automático
+  setTimeout(() => isSeeking = false, 200);
+};
+
+// Actualizar la barra automáticamente mientras suena
+function updateSeekBar() {
+  if (!audioBuffer || !source || isSeeking) return;
+
+  // posición actual del audio
+  const current =
+    (audioCtx.currentTime - startTime) + startOffset;
+
+  const normalized = Math.min(current / audioBuffer.duration, 1);
+  seekSlider.value = normalized;
+}
+
+/* ---------------- Animation ---------------- */
+function animate(time){
+  requestAnimationFrame(animate);
+
+  let amps = new Float32Array(16);
+
+  if (isTestMode){
+    for (let i=0;i<16;i++)
+      amps[i] = 0.1 + 0.9*Math.abs(Math.sin(time*0.0003+i));
+  }
+  else if (!isPaused && analyser){
+    analyser.getByteFrequencyData(spectrum);
+    for (let i=0;i<16;i++){
+      const t=(i+1)/16;
+      const freq=80*Math.pow(20000/20,t);
+      const bin=Math.round(freq/(audioCtx.sampleRate/analyser.fftSize));
+
+      let sum=0, count=0;
+      for(let k=-8;k<=8;k++){
+        const idx=Math.min(Math.max(0,bin+k), spectrum.length-1);
+        sum+=spectrum[idx]; count++;
+      }
+      const avg=sum/(count*255);
+      amps[i]=Math.min(avg*3.0,1.0);
+    }
+  }
+
+  gl.uniform1fv(u_modesLoc, amps);
+  gl.uniform2f(u_offsetLoc, offsetX, offsetY);
+
+  gl.clearColor(0,0,0,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+  
+  updateSeekBar();
+}
+
+animate();
+</script>
+</body>
+</html>
